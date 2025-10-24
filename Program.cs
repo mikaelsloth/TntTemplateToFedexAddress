@@ -7,9 +7,9 @@
 
     internal class Program
     {
-        internal static readonly char[] separator = [';'];
-        internal static readonly string headerLine = "Nickname,FullName,FirstName,LastName,Title,Company,Department,AddressOne,AddressTwo,City,State,Zip,PhoneNumber,ExtensionNumber,FAXNumber,PagerNumber,MobilePhoneNumber,CountryCode,EmailAddress,VerifiedFlag,AcceptedFlag,ValidFlag,ResidentialFlag,CustomsIDEIN,ReferenceDescription,ServiceTypeCode,PackageTypeCode,CollectionMethodCode,BillCode,BillAccountNumber,DutyBillCode,DutyBillAccountNumber,CurrencyTypeCode,InsightIDNumber,GroundReferenceDescription,ShipmentNotificationRecipientEmail,RecipientEmailLanguage,RecipientEmailShipmentnotification,RecipientEmailExceptionnotification,RecipientEmailDeliverynotification,PartnerTypeCodes,NetReturnBillAccountNumber,CustomsIDTypeCode,AddressTypeCode,ShipmentNotificationSenderEmail,SenderEmailLanguage,SenderEmailShipmentnotification,SenderEmailExceptionnotification,SenderEmailDeliverynotification,RecipientEmailPickupnotification,SenderEmailPickupnotification,OpCoTypeCd,BrokerAccounttID,BrokerTaxID,DefaultBrokerID,RecipientEmailTenderednotification,SenderEmailTenderednotification,UserAccountNumber,DeliveryInstructions,EstimatedDeliveryFlag,SenderEstimatedDeliveryFlag,ShipmentNotificationSenderDeliveryChannel,ShipmentNotificationSenderMobileNo,ShipmentNotificationSenderMobileNoCountry,ShipmentNotificationSenderMobileNoLanguage";
-        internal static readonly Dictionary<string, string> columnMap = new(StringComparer.OrdinalIgnoreCase)
+        private static readonly char[] separator = [';'];
+        private static readonly string headerLine = "Nickname,FullName,FirstName,LastName,Title,Company,Department,AddressOne,AddressTwo,City,State,Zip,PhoneNumber,ExtensionNumber,FAXNumber,PagerNumber,MobilePhoneNumber,CountryCode,EmailAddress,VerifiedFlag,AcceptedFlag,ValidFlag,ResidentialFlag,CustomsIDEIN,ReferenceDescription,ServiceTypeCode,PackageTypeCode,CollectionMethodCode,BillCode,BillAccountNumber,DutyBillCode,DutyBillAccountNumber,CurrencyTypeCode,InsightIDNumber,GroundReferenceDescription,ShipmentNotificationRecipientEmail,RecipientEmailLanguage,RecipientEmailShipmentnotification,RecipientEmailExceptionnotification,RecipientEmailDeliverynotification,PartnerTypeCodes,NetReturnBillAccountNumber,CustomsIDTypeCode,AddressTypeCode,ShipmentNotificationSenderEmail,SenderEmailLanguage,SenderEmailShipmentnotification,SenderEmailExceptionnotification,SenderEmailDeliverynotification,RecipientEmailPickupnotification,SenderEmailPickupnotification,OpCoTypeCd,BrokerAccounttID,BrokerTaxID,DefaultBrokerID,RecipientEmailTenderednotification,SenderEmailTenderednotification,UserAccountNumber,DeliveryInstructions,EstimatedDeliveryFlag,SenderEstimatedDeliveryFlag,ShipmentNotificationSenderDeliveryChannel,ShipmentNotificationSenderMobileNo,ShipmentNotificationSenderMobileNoCountry,ShipmentNotificationSenderMobileNoLanguage";
+        private static readonly Dictionary<string, string> columnMap = new(StringComparer.OrdinalIgnoreCase)
         {
             // csvHeaderName => jsonKeyOrSpecial
             { "Nickname", "Part1" },          // use Part1 value
@@ -27,12 +27,29 @@
             { "AcceptedFlag", "DEFAULT:N" },
             { "ValidFlag", "DEFAULT:Y" }
         };
+        private static readonly char[] s_singleMap = CreateSingleMap();
+        private static readonly bool skipFirstLine = true;
 
         static async Task Main()
         {
             string folderPath = "C:\\Temp";
             string inputPath = folderPath + "\\000040562.txt";
             string outputPath = folderPath + "\\FedExAddressBook.csv";
+
+            //Dictionary<int, char> charDict = new Dictionary<int, char>();
+
+            //for (int i = 32; i < 128; i++)
+            //{
+            //    charDict[i] = (char)i;
+            //}
+
+            //using var file = new StreamWriter(folderPath + "\\charmap.txt", false, Encoding.UTF8);
+            //foreach (var kvp in charDict.OrderBy(s => s.Key))
+            //{
+            //    file.WriteLine($"{kvp.Key}\t\tmap['{kvp.Value}'] = ' ';");
+            //}
+
+            //return;
 
             // Provide the CSV header line here (comma-separated).
             // Include "Part1" as a special column name to get the value from parts[1].
@@ -153,10 +170,10 @@
             using var writer = new StreamWriter(outputPath, false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
 
             // Write header
-            await writer.WriteLineAsync(string.Join(",", headerColumns.Select(CsvEscape)));
+            await writer.WriteLineAsync(string.Join(",", headerColumns.Select(a => CsvEscape(a))));
 
             // Write rows in original order
-            for (int i = 0; i < results.Length; i++)
+            for (int i = skipFirstLine ? 1 : 0; i < results.Length; i++)
             {
                 var row = results[i];
 
@@ -168,8 +185,8 @@
                     if (c > 0) sb.Append(','); // comma separator
 
                     string? rawValue = getters[c](row); // fast lookup
-                    string escaped = CsvEscape(rawValue);
-                    sb.Append(escaped);
+                    string normalized = CsvEscape(rawValue, false);
+                    sb.Append(normalized);
                 }
 
                 await writer.WriteLineAsync(sb.ToString());
@@ -179,12 +196,145 @@
         }
 
         // Helper moved to class level to avoid CS4033
-        private static string CsvEscape(string? field)
+        private static string CsvEscape(string? origin, bool specialCountry = false)
         {
-            if (field is null) return "";
-            bool mustQuote = field.Contains('"') || field.Contains(',') || field.Contains('\n') || field.Contains('\r')
-                             || field.StartsWith(' ') || field.EndsWith(' ');
-            return !mustQuote ? field : "\"" + field.Replace("\"", "\"\"") + "\"";
+            return string.IsNullOrEmpty(origin) ? "" : Normalize(origin, specialCountry).Trim(' ');
+        }
+
+        // Public API
+        // origin: input string (Latin-1). specialCountry: expand Ä/ä/Ö/ö/Ü/ü to Ae/Oe/Ue respectively.
+        public static string Normalize(string origin, bool specialCountry)
+         {
+            var src = origin.AsSpan();
+
+            // First pass: determine exact output length
+            int outLen = 0;
+            for (int i = 0; i < src.Length; i++)
+            {
+                char c = src[i];
+
+                var multi = Latin1Normalizer.TryMulti(c, specialCountry);
+                outLen += (multi != null) ? multi.Length : 1;
+            }
+
+            // Second pass: fill into a stack-allocated buffer
+            Span<char> buffer = stackalloc char[outLen];
+            int pos = 0;
+
+            for (int i = 0; i < src.Length; i++)
+            {
+                char c = src[i];
+                var multi = Latin1Normalizer.TryMulti(c, specialCountry);
+                if (multi != null)
+                {
+                    for (int j = 0; j < multi.Length; j++)
+                        buffer[pos++] = multi[j];
+                }
+                else
+                {
+                    char mapped = c switch
+                    {
+                        (char)8217 => '\'',
+                        (char)8211 => '-',
+                        _ => s_singleMap[c]
+                    };
+                    buffer[pos++] = mapped;
+                }
+            }
+
+            // Create the final string from the buffer
+            return new string(buffer[..outLen]);
+        }
+
+        private static char[] CreateSingleMap()
+        {
+            var map = new char[383];
+            // Initialize to identity
+            for (int i = 0; i < map.Length; i++) map[i] = (char)i;
+
+            // Common diacritics to ASCII equivalents (Latin-1 → ASCII)
+            map['À'] = 'A'; map['Á'] = 'A'; map['Â'] = 'A'; map['Ã'] = 'A'; map['Ä'] = 'A'; map['Å'] = 'A'; map['Æ'] = 'A';
+            map['Ç'] = 'C';
+            map['È'] = 'E'; map['É'] = 'E'; map['Ê'] = 'E'; map['Ë'] = 'E';
+            map['Ì'] = 'I'; map['Í'] = 'I'; map['Î'] = 'I'; map['Ï'] = 'I';
+            map['Ð'] = 'D';
+            map['Ñ'] = 'N';
+            map['Ò'] = 'O'; map['Ó'] = 'O'; map['Ô'] = 'O'; map['Õ'] = 'O'; map['Ö'] = 'O'; map['Ø'] = 'O';
+            map['Ù'] = 'U'; map['Ú'] = 'U'; map['Û'] = 'U'; map['Ü'] = 'U';
+            map['Ý'] = 'Y';
+            map['à'] = 'a'; map['á'] = 'a'; map['â'] = 'a'; map['ã'] = 'a'; map['ä'] = 'a'; map['å'] = 'a'; map['æ'] = 'a'; map['ç'] = 'c';
+            map['è'] = 'e'; map['é'] = 'e'; map['ê'] = 'e'; map['ë'] = 'e';
+            map['ì'] = 'i'; map['í'] = 'i'; map['î'] = 'i'; map['ï'] = 'i';
+            map['ð'] = 'o';
+            map['ñ'] = 'n';
+            map['ò'] = 'o'; map['ó'] = 'o'; map['ô'] = 'o'; map['õ'] = 'o'; map['ö'] = 'o'; map['ø'] = 'o';
+            map['ù'] = 'u'; map['ú'] = 'u'; map['û'] = 'u'; map['ü'] = 'u';
+            map['ý'] = 'y'; map['ÿ'] = 'y';
+            map['Ā'] = 'A'; map['ā'] = 'a';
+            map['Ă'] = 'A'; map['ă'] = 'a';
+            map['Ą'] = 'A'; map['ą'] = 'a';
+            map['Ć'] = 'C'; map['ć'] = 'c';
+            map['Ĉ'] = 'C'; map['ĉ'] = 'c';
+            map['Ċ'] = 'C'; map['ċ'] = 'c';
+            map['Č'] = 'C'; map['č'] = 'c';
+            map['Ď'] = 'D'; map['ď'] = 'd';
+            map['Đ'] = 'D'; map['đ'] = 'd';
+            map['Ē'] = 'E'; map['ē'] = 'e';
+            map['Ĕ'] = 'E'; map['ĕ'] = 'e';
+            map['Ė'] = 'E'; map['ė'] = 'e';
+            map['Ę'] = 'E'; map['ę'] = 'e';
+            map['Ě'] = 'E'; map['ě'] = 'e';
+            map['Ĝ'] = 'G'; map['ĝ'] = 'g';
+            map['Ğ'] = 'G'; map['ğ'] = 'g';
+            map['Ġ'] = 'G'; map['ġ'] = 'g';
+            map['Ģ'] = 'G'; map['ģ'] = 'g';
+            map['Ĥ'] = 'H'; map['ĥ'] = 'h';
+            map['Ħ'] = 'H'; map['ħ'] = 'h';
+            map['Ĩ'] = 'I'; map['ĩ'] = 'i';
+            map['Ī'] = 'I'; map['ī'] = 'i';
+            map['Ĭ'] = 'I'; map['ĭ'] = 'i';
+            map['Į'] = 'I'; map['į'] = 'i';
+            map['İ'] = 'I'; map['ı'] = 'i';
+            map['Ĵ'] = 'J'; map['ĵ'] = 'j';
+            map['Ķ'] = 'K'; map['ķ'] = 'k';
+            map['Ĺ'] = 'L'; map['ĺ'] = 'l';
+            map['Ļ'] = 'L'; map['ļ'] = 'l';
+            map['Ľ'] = 'L'; map['ľ'] = 'l';
+            map['Ŀ'] = 'L'; map['ŀ'] = 'l';
+            map['Ł'] = 'L'; map['ł'] = 'l';
+            map['Ń'] = 'N'; map['ń'] = 'n';
+            map['Ņ'] = 'N'; map['ņ'] = 'n';
+            map['Ň'] = 'N'; map['ň'] = 'n';
+            map['Ō'] = 'O'; map['ō'] = 'o';
+            map['Ŏ'] = 'O'; map['ŏ'] = 'o';
+            map['Ő'] = 'O'; map['ő'] = 'o';
+            map['Ŕ'] = 'R'; map['ŕ'] = 'r';
+            map['Ŗ'] = 'R'; map['ŗ'] = 'r';
+            map['Ř'] = 'R'; map['ř'] = 'r';
+            map['Ś'] = 'S'; map['ś'] = 's';
+            map['Ŝ'] = 'S'; map['ŝ'] = 's';
+            map['Ş'] = 'S'; map['ş'] = 's';
+            map['Š'] = 'S'; map['š'] = 's';
+            map['Ţ'] = 'T'; map['ţ'] = 't';
+            map['Ť'] = 'T'; map['ť'] = 't';
+            map['Ŧ'] = 'T'; map['ŧ'] = 't';
+            map['Ũ'] = 'U'; map['ũ'] = 'u';
+            map['Ū'] = 'U'; map['ū'] = 'u';
+            map['Ŭ'] = 'U'; map['ŭ'] = 'u';
+            map['Ů'] = 'U'; map['ů'] = 'u';
+            map['Ű'] = 'U'; map['ű'] = 'u';
+            map['Ų'] = 'U'; map['ų'] = 'u';
+            map['Ŵ'] = 'W'; map['ŵ'] = 'w';
+            map['Ŷ'] = 'Y'; map['ŷ'] = 'y';
+            map['Ÿ'] = 'Y'; map['Ź'] = 'Z';
+            map['ź'] = 'z'; map['Ż'] = 'Z';
+            map['ż'] = 'z'; map['Ž'] = 'Z'; map['ž'] = 'z';
+            map['"'] = ' ';
+            map[','] = ' ';
+            map['\r'] = ' ';
+            map['\n'] = ' ';
+            // Keep other characters as-is (pass-through)
+            return map;
         }
     }
 
@@ -193,5 +343,29 @@
         public int LineIndex { get; set; } = lineIndex;
         public string Part1 { get; set; } = part1;
         public Dictionary<string, string?> Receiver { get; set; } = receiver;
+    }
+
+    internal static class Latin1Normalizer
+    {
+        // Multi-char replacements. Returns null if no multi-char replacement is needed.
+        internal static string? TryMulti(char c, bool specialCountry)
+        {
+            return c switch
+            {
+                'Æ' => "Ae",
+                'æ' => "ae",
+                'ß' => "ss",
+                'Þ' => "Th",
+                'þ' => "th",
+                // Special country expansions (only when requested)
+                'Ä' => specialCountry ? "Ae" : null,
+                'ä' => specialCountry ? "ae" : null,
+                'Ö' => specialCountry ? "Oe" : null,
+                'ö' => specialCountry ? "oe" : null,
+                'Ü' => specialCountry ? "Ue" : null,
+                'ü' => specialCountry ? "ue" : null,
+                _ => null,
+            };
+        }
     }
 }
