@@ -9,23 +9,24 @@
     {
         private static readonly char[] separator = [';'];
         private static readonly string headerLine = "Nickname,FullName,FirstName,LastName,Title,Company,Department,AddressOne,AddressTwo,City,State,Zip,PhoneNumber,ExtensionNumber,FAXNumber,PagerNumber,MobilePhoneNumber,CountryCode,EmailAddress,VerifiedFlag,AcceptedFlag,ValidFlag,ResidentialFlag,CustomsIDEIN,ReferenceDescription,ServiceTypeCode,PackageTypeCode,CollectionMethodCode,BillCode,BillAccountNumber,DutyBillCode,DutyBillAccountNumber,CurrencyTypeCode,InsightIDNumber,GroundReferenceDescription,ShipmentNotificationRecipientEmail,RecipientEmailLanguage,RecipientEmailShipmentnotification,RecipientEmailExceptionnotification,RecipientEmailDeliverynotification,PartnerTypeCodes,NetReturnBillAccountNumber,CustomsIDTypeCode,AddressTypeCode,ShipmentNotificationSenderEmail,SenderEmailLanguage,SenderEmailShipmentnotification,SenderEmailExceptionnotification,SenderEmailDeliverynotification,RecipientEmailPickupnotification,SenderEmailPickupnotification,OpCoTypeCd,BrokerAccounttID,BrokerTaxID,DefaultBrokerID,RecipientEmailTenderednotification,SenderEmailTenderednotification,UserAccountNumber,DeliveryInstructions,EstimatedDeliveryFlag,SenderEstimatedDeliveryFlag,ShipmentNotificationSenderDeliveryChannel,ShipmentNotificationSenderMobileNo,ShipmentNotificationSenderMobileNoCountry,ShipmentNotificationSenderMobileNoLanguage";
-        private static readonly Dictionary<string, string> columnMap = new(StringComparer.OrdinalIgnoreCase)
+        private static readonly Dictionary<string, (string, bool, string, Func<string?, string?>?)> columnMap = new(StringComparer.OrdinalIgnoreCase)
         {
+            // value tuple: (jsonKey, useDefaultFlag, defaultValue, normalizationFunc)
             // csvHeaderName => jsonKeyOrSpecial
-            { "Nickname", "Part1" },          // use Part1 value
-            { "FullName", "contactName" },      // map to receiver["company"]
-            { "Company", "company" },      // map to receiver["contactName"]
-            { "AddressOne", "addressLine1" },
-            { "AddressTwo", "addressLine2" },
-            { "City", "city" },
-            { "State", "state" },
-            { "Zip", "postcode" },
-            { "PhoneNumber", "phoneNumber" },
-            { "CountryCode", "country" },
-            { "EmailAddress", "email" },
-            { "VerifiedFlag", "DEFAULT:Y" },
-            { "AcceptedFlag", "DEFAULT:N" },
-            { "ValidFlag", "DEFAULT:Y" }
+            { "Nickname", ("Part1", false, "", null) },            // use Part1 value
+            { "FullName", ("contactName", false, "", null) },      // map to receiver["company"]
+            { "Company", ("company", false, "", null) },           // map to receiver["contactName"]
+            { "AddressOne", ("addressLine1", false, "", null) },
+            { "AddressTwo", ("addressLine2", false, "", null) },
+            { "City", ("city", false, "", null) },
+            { "State", ("state", false, "", null) },
+            { "Zip", ("postcode", false, "", null) },
+            { "PhoneNumber", ("phoneNumber", false, "", NormalizePhoneNumbers) },
+            { "CountryCode", ("country", false, "", null) },
+            { "EmailAddress", ("email", false, "", null) },
+            { "VerifiedFlag", ("", true, "Y", null) },
+            { "AcceptedFlag", ("", true, "N", null) },
+            { "ValidFlag", ("", true, "Y", null) }
         };
         private static readonly char[] s_singleMap = CreateSingleMap();
         private static readonly bool skipFirstLine = true;
@@ -143,26 +144,52 @@
                         return new Func<SingleResult, string?>(row => null);
                     }
 
-                    const string DefaultPrefix = "DEFAULT:";
-                    if (mapTarget.StartsWith(DefaultPrefix, StringComparison.OrdinalIgnoreCase))
+                    // unpack for clarity
+                    string jsonKey = mapTarget.Item1;
+                    bool useDefault = mapTarget.Item2;
+                    string defaultValue = mapTarget.Item3;
+                    Func<string?, string?>? normalize = mapTarget.Item4;
+
+                    // helper to apply normalization (handle null)
+                    string? ApplyNormalize(string? v) => normalize != null ? normalize(v) : v;
+
+                    if (useDefault)
                     {
-                        string defaultValue = mapTarget[DefaultPrefix.Length..]; 
-                        // may be empty
-                        // Return defaultValue for every row (no need to inspect the row)
-                        return new Func<SingleResult, string?>(_ => string.IsNullOrEmpty(defaultValue) ? null : defaultValue);
+                        if (string.IsNullOrEmpty(jsonKey))
+                        {
+                            // always return default (or null if default is empty), with normalization
+                            return new Func<SingleResult, string?>(_ => ApplyNormalize(string.IsNullOrEmpty(defaultValue) ? null : defaultValue));
+                        }
+                        else
+                        {
+                            // prefer receiver value, but fall back to default when missing/null/empty
+                            return new Func<SingleResult, string?>(row =>
+                            {
+                                if (row.Receiver != null && row.Receiver.TryGetValue(jsonKey, out var v) && !string.IsNullOrEmpty(v))
+                                {
+                                    return ApplyNormalize(v);
+                                }
+                                return ApplyNormalize(string.IsNullOrEmpty(defaultValue) ? null : defaultValue);
+                            });
+                        }
                     }
 
-                    if (string.Equals(mapTarget, "Part1", StringComparison.OrdinalIgnoreCase))
+                    if (string.Equals(jsonKey, "Part1", StringComparison.OrdinalIgnoreCase))
                     {
-                        // special case: use Part1 field
-                        return new Func<SingleResult, string?>(row => row.Part1);
+                        // special case: use Part1 field (normalized)
+                        return new Func<SingleResult, string?>(row => ApplyNormalize(row.Part1));
                     }
                     else
                     {
                         // Normal case: look up the mapped JSON key in receiver dictionary.
-                        // Capture the mapped key in a local to avoid closure pitfalls.
-                        string jsonKey = mapTarget;
-                        return new Func<SingleResult, string?>(row => row.Receiver != null && row.Receiver.TryGetValue(jsonKey, out var v) ? v : null);
+                        return new Func<SingleResult, string?>(row =>
+                        {
+                            if (row.Receiver != null && row.Receiver.TryGetValue(jsonKey, out var v))
+                            {
+                                return ApplyNormalize(v);
+                            }
+                            return ApplyNormalize(null);
+                        });
                     }
                 })];
 
@@ -176,16 +203,21 @@
             for (int i = skipFirstLine ? 1 : 0; i < results.Length; i++)
             {
                 var row = results[i];
+                var countryGetter = getters!.FirstOrDefault(g => g.Method.Name.Contains("CountryCode"));
+                var country = countryGetter != null ? countryGetter(row) : null;
+                bool specialCountry = string.Equals(country, "DE", StringComparison.OrdinalIgnoreCase) ||
+                                      string.Equals(country, "AT", StringComparison.OrdinalIgnoreCase) ||
+                                      string.Equals(country, "CH", StringComparison.OrdinalIgnoreCase);
 
                 // Use a StringBuilder per line to reduce allocations (optional optimization)
                 var sb = new StringBuilder();
 
-                for (int c = 0; c < getters.Length; c++)
+                for (int c = 0; c < getters!.Length; c++)
                 {
                     if (c > 0) sb.Append(','); // comma separator
 
                     string? rawValue = getters[c](row); // fast lookup
-                    string normalized = CsvEscape(rawValue, false);
+                    string normalized = CsvEscape(rawValue, specialCountry);
                     sb.Append(normalized);
                 }
 
@@ -201,10 +233,36 @@
             return string.IsNullOrEmpty(origin) ? "" : Normalize(origin, specialCountry).Trim(' ');
         }
 
+        internal static string NormalizePhoneNumbers(string? src)
+        {
+            if (string.IsNullOrEmpty(src)) return string.Empty;
+
+            // count digits first
+            int count = 0;
+            for (int i = 0; i < src.Length; i++)
+            {
+                char c = src[i];
+                if (c >= '0' && c <= '9') count++;
+            }
+            if (count == src.Length) return src; // nothing to remove
+            if (count == 0) return string.Empty;
+
+            // create result of exact length and fill it
+            return string.Create(count, src, (span, s) =>
+            {
+                int j = 0;
+                for (int i = 0; i < s.Length; i++)
+                {
+                    char c = s[i];
+                    if (c >= '0' && c <= '9') span[j++] = c;
+                }
+            });
+        }
+
         // Public API
-        // origin: input string (Latin-1). specialCountry: expand Ä/ä/Ö/ö/Ü/ü to Ae/Oe/Ue respectively.
+        // origin: input string (Latin-1 + Latin-2). specialCountry: expand Ä/ä/Ö/ö/Ü/ü to Ae/Oe/Ue respectively.
         public static string Normalize(string origin, bool specialCountry)
-         {
+        {
             var src = origin.AsSpan();
 
             // First pass: determine exact output length
